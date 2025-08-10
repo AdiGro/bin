@@ -497,6 +497,7 @@ dependencies = [
  "parking_lot",
  "pretty_env_logger",
  "rand 0.9.1",
+ "regex",
  "serde",
  "syntect",
  "time",

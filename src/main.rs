@@ -24,6 +24,7 @@ use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::LazyLock,
 };
+use regex::Regex;
 use syntect::html::{ClassStyle, css_for_theme_with_class_style};
 
 #[derive(argh::FromArgs, Clone)]
@@ -84,10 +85,20 @@ async fn main() -> std::io::Result<()> {
 
 #[derive(Template)]
 #[template(path = "index.html")]
-struct Index;
+struct Index {
+    query_string: String,
+}
 
 async fn index(req: HttpRequest) -> Result<HttpResponse, Error> {
-    render_template(&req, &Index)
+    let query_string = req.query_string().to_string();
+    let index = Index { 
+        query_string: if query_string.is_empty() { 
+            String::new() 
+        } else { 
+            format!("?{}", query_string) 
+        } 
+    };
+    render_template(&req, &index)
 }
 
 #[derive(serde::Deserialize)]
@@ -95,8 +106,32 @@ struct IndexForm {
     val: Bytes,
 }
 
-async fn submit(input: web::Form<IndexForm>, store: Data<PasteStore>) -> impl Responder {
-    let id = generate_id();
+#[derive(serde::Deserialize)]
+struct SubmitQuery {
+    id: Option<String>,
+}
+
+async fn submit(
+    input: web::Form<IndexForm>, 
+    query: web::Query<SubmitQuery>,
+    store: Data<PasteStore>
+) -> impl Responder {
+    let preferred_id = query.id.as_deref();
+    
+    // Use the provided ID if it doesn't exist, otherwise generate a random one
+    let id = if let Some(preferred_id) = preferred_id {
+        if get_paste(&store, preferred_id).is_some() {
+            // ID already exists, generate a random one
+            generate_id()
+        } else {
+            // ID is available, use it
+            preferred_id.to_string()
+        }
+    } else {
+        // No ID provided, generate a random one
+        generate_id()
+    };
+    
     let uri = format!("/{id}");
     store_paste(&store, id, input.into_inner().val);
     HttpResponse::Found()
@@ -106,10 +141,26 @@ async fn submit(input: web::Form<IndexForm>, store: Data<PasteStore>) -> impl Re
 
 async fn submit_raw(
     data: Bytes,
+    query: web::Query<SubmitQuery>,
     host: HostHeader,
     store: Data<PasteStore>,
 ) -> Result<String, Error> {
-    let id = generate_id();
+    let preferred_id = query.id.as_deref();
+    
+    // Use the provided ID if it doesn't exist, otherwise generate a random one
+    let id = if let Some(preferred_id) = preferred_id {
+        if get_paste(&store, preferred_id).is_some() {
+            // ID already exists, generate a random one
+            generate_id()
+        } else {
+            // ID is available, use it
+            preferred_id.to_string()
+        }
+    } else {
+        // No ID provided, generate a random one
+        generate_id()
+    };
+    
     let uri = if let Some(Ok(host)) = host.0.as_ref().map(|v| std::str::from_utf8(v.as_bytes())) {
         format!("https://{host}/{id}\n")
     } else {
@@ -119,6 +170,23 @@ async fn submit_raw(
     store_paste(&store, id, data);
 
     Ok(uri)
+}
+
+/// Convert URLs in text to clickable links
+fn make_links_clickable(content: &str) -> String {
+    static URL_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?i)\b(?:https?://|www\.)[^\s<>&]+[^\s<>&.,;!?]").unwrap()
+    });
+    
+    URL_REGEX.replace_all(content, |caps: &regex::Captures| {
+        let url = caps.get(0).unwrap().as_str();
+        let href = if url.starts_with("http") {
+            url.to_string()
+        } else {
+            format!("http://{}", url)
+        };
+        format!(r#"<a href="{}" target="_blank" rel="noopener noreferrer">{}</a>"#, href, url)
+    }).to_string()
 }
 
 #[derive(Template)]
@@ -153,6 +221,9 @@ async fn show_paste(
             },
             None => htmlescape::encode_minimal(data),
         };
+
+        // Make URLs clickable in the highlighted content
+        let code_highlighted = make_links_clickable(&code_highlighted);
 
         // Add <code> tags to enable line numbering with CSS
         let content = format!(
